@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+      - uses: actions-rust-lang/rustfmt@v1
+      - run: cargo clippy --all-targets
+      - run: cargo clippy --no-default-features
+      - run: cargo clippy --no-default-features --features std --all-targets
+      - run: cargo test
+        env:
+          LCM_REQUIRE_MULTICAST: 1
+      - run: cargo test --no-default-features --features std
+      - run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo publish --dry-run
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: msrv
+        uses: actions-rust-lang/msrv@v0.1.1
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.msrv.outputs.msrv }}
+      - run: cargo build --all-features
+      - run: cargo build --no-default-features
+
+  portability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: i686-unknown-linux-gnu, thumbv7em-none-eabihf
+      - run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - run: cargo test --no-default-features --target i686-unknown-linux-gnu
+      - run: cargo build --no-default-features --target thumbv7em-none-eabihf

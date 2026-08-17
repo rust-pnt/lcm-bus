@@ -1,0 +1,28 @@
+[package]
+name = "lcm-bus"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MPL-2.0"
+description = "A pure Rust Lightweight Communications and Marshalling (LCM) bus"
+repository = "https://github.com/rust-pnt/lcm-bus"
+readme = "README.md"
+exclude = [".github", "tests", ".gitignore"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+fancy-regex = { version = "0.19", optional = true }
+socket2 = { version = "0.6", features = ["all"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[features]
+default = ["std", "patterns"]
+std = ["dep:socket2", "dep:libc"]
+patterns = ["std", "dep:fancy-regex"]
+
+[dev-dependencies]
+socket2 = { version = "0.6", features = ["all"] }
