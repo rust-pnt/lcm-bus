@@ -543,7 +543,7 @@ impl Client {
             return Err(ClientError::NotARelay);
         };
         Self::serve_tcpq(
-            &serve::bind_address(&relay),
+            &serve::bind_address(url, &relay),
             Some(Receiving {
                 subscriptions: Arc::new(RwLock::new(subscriptions)),
                 handler: Arc::new(handler),

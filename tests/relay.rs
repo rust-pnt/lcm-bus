@@ -301,3 +301,32 @@ fn a_group_and_a_log_have_no_relay() {
         );
     }
 }
+
+/// A URL that states a host binds that host, and one that states none binds every
+/// address.
+///
+/// `BusUrl::parse` fills an empty host with the address a client dials, so the parsed
+/// host is `127.0.0.1` whether the URL stated it or stated nothing, and cannot decide
+/// this.
+#[test]
+fn a_stated_host_is_the_host_that_is_bound() {
+    let heard = Arc::new(Collector::default());
+    let relay =
+        Client::serve("tcpq://127.0.0.1:0", Subscriptions::new(), heard).expect("loopback binds");
+    let bound = relay.bound().expect("bound");
+    assert_eq!(
+        bound.ip().to_string(),
+        "127.0.0.1",
+        "a URL that states loopback must not bind every address"
+    );
+    let _ = relay.close();
+
+    let heard = Arc::new(Collector::default());
+    let every = Client::serve("tcpq://:0", Subscriptions::new(), heard).expect("every address");
+    assert_eq!(
+        every.bound().expect("bound").ip().to_string(),
+        "0.0.0.0",
+        "a URL that states no host binds every address"
+    );
+    let _ = every.close();
+}

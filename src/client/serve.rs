@@ -7,7 +7,7 @@
 //! reaches it not at all: LCM's own relay reads the same frames in the same sequence.
 
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -378,16 +378,14 @@ pub(super) fn publish_from_local(
     Ok(())
 }
 
-/// The address to bind, from a `tcpq://` URL.
+/// `tcpq://127.0.0.1:7700` binds loopback alone, and `tcpq://:7700` binds every address.
 ///
-/// [`BusUrl::parse`](crate::BusUrl::parse) fills an empty host with the address LCM's
-/// own relay dials.
-/// A relay binds and does not dial, so an empty host here is every address of this
-/// machine and not that one.
-pub(super) fn bind_address(relay: &crate::url::Relay) -> String {
-    match relay.host.as_str() {
-        // That default is a loopback address, and a bind on it serves this host alone.
-        host if host == crate::url::DEFAULT_TCPQ_HOST => format!("0.0.0.0:{}", relay.port),
-        host => format!("{host}:{}", relay.port).to_string(),
+/// The URL says which and `relay.host` does not: `BusUrl::parse` fills an empty host
+/// with the address a client dials, so both reach here as the same string.
+pub(super) fn bind_address(url: &str, relay: &crate::url::Relay) -> String {
+    let stated = url.strip_prefix("tcpq://").unwrap_or(url);
+    match stated.is_empty() || stated.starts_with(':') {
+        true => format!("0.0.0.0:{}", relay.port),
+        false => format!("{}:{}", relay.host, relay.port),
     }
 }
