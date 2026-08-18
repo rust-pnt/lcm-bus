@@ -361,7 +361,7 @@ impl Outbox {
 /// fails ends the connection, and the socket with it, so that the handler
 /// hears one `Stop` for both halves. Every way out counts what the queue
 /// still held.
-fn tcpq_writer(
+pub(super) fn tcpq_writer(
     stream: &TcpStream,
     outbox: &Outbox,
     writable: &AtomicBool,
@@ -856,7 +856,7 @@ mod tests {
         // A little in the outbox, and most of the budget free.
         outbox.put_message(alloc::vec![7u8; 1024], far).unwrap();
 
-        // No free room could ever hold this one, and it goes in all the same.
+        // No free room ever holds this one, and it goes in all the same.
         assert_eq!(
             outbox.put_message(alloc::vec![7u8; OUTBOX_BYTES + 1], Instant::now()),
             Ok(()),
@@ -984,10 +984,11 @@ mod tests {
     /// The frame the writer holds is not on the budget, so a message on the
     /// wire does not stop the next one being let in.
     ///
-    /// Counting it would: a message above the budget holds the whole outbox
-    /// for as long as it takes to write, and every publish behind it waits
-    /// its own deadline and then fails. On a slow link that is hours of a
-    /// client that says it is connected and takes nothing.
+    /// A budget that counted it would: a message above the budget holds the whole
+    /// outbox for as long as it takes to write, and every publish behind it waits its
+    /// own deadline and then fails.
+    /// On a slow link that is hours of a client that says it is connected and takes
+    /// nothing.
     #[test]
     fn a_message_on_the_wire_does_not_hold_the_outbox() {
         let outbox = Outbox::new();

@@ -263,9 +263,10 @@ fn fragments_out_of_order_and_repeated_still_make_one_message() {
     assert_eq!(reassembler.in_flight(), 1);
 }
 
-/// The budget counts the bytes that came, so a length a sender claims and
-/// never sends costs nothing and pushes nothing else out. Charging the claim
-/// instead let one datagram evict every message a bus was putting together.
+/// The budget counts the bytes that came, so a length a sender claims and never sends
+/// costs nothing and pushes nothing else out.
+/// A budget that charged the claim instead let one datagram evict every message a bus
+/// was putting together.
 #[test]
 fn a_claim_takes_none_of_the_fragment_budget() {
     let mut reassembler = udpm::Reassembler::new();

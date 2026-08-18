@@ -1114,7 +1114,7 @@ fn a_replay_says_it_takes_no_messages() {
     assert!(writing.can_publish());
 }
 
-/// Recording a bus needs the time of the event and not the time of the write.
+/// A log of a bus holds the time of the event and not the time of the write.
 /// Without that, a log read and written again comes out re-timed, and its
 /// replay no longer holds to what happened.
 #[test]

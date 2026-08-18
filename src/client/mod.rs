@@ -6,6 +6,14 @@
 mod logfile;
 mod multicast;
 mod relay;
+// A relay matches the patterns its clients send, and those are Java regular
+// expressions.
+// Without an engine for one, a relay takes a pattern for the name of a channel.
+// A client that asked for `/pntos/.*` then gets silence.
+// That is a bus that carries the wrong thing, so this says what it needs when it
+// is built.
+#[cfg(feature = "patterns")]
+mod serve;
 
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -161,7 +169,7 @@ pub trait DeliveryHandler: Send + Sync {
 }
 
 /// The messages a [`Client`] took off a bus, and the count of the ones it
-/// could not give on.
+/// did not give on.
 ///
 /// A bus does not wait for a reader. A handler that does slow work holds the
 /// socket while the kernel drops what arrives, so the usual first handler
@@ -251,7 +259,7 @@ pub struct Stats {
     pub received: u64,
     /// Messages a subscription matched and the handler was given.
     pub delivered: u64,
-    /// Datagrams this client could not read, and fragments that did not agree.
+    /// Datagrams this client cannot read, and fragments that did not agree.
     /// A bad sender is counted here and not reported.
     pub discarded: u64,
     /// Messages with fragments this client waits for.
@@ -306,7 +314,7 @@ pub enum ClientError {
     Handshake(WireError),
     /// A subscription pattern the regex engine refused.
     Pattern(BadPattern),
-    /// A frame could not be read or written.
+    /// A read or a write of a frame failed.
     Wire(WireError),
     /// A log open to read cannot publish.
     ReadOnly,
@@ -318,6 +326,9 @@ pub enum ClientError {
     NotAFile,
     /// The connection is closed.
     Closed,
+    /// Only `tcpq://` has a relay to serve.
+    /// A group and a log have no client that dials them.
+    NotARelay,
 }
 
 impl core::fmt::Display for ClientError {
@@ -332,6 +343,7 @@ impl core::fmt::Display for ClientError {
             Self::PublishOnly => f.write_str("a publisher takes no subscriptions"),
             Self::NotAFile => f.write_str("a log to replay is a file"),
             Self::Closed => f.write_str("the connection is closed"),
+            Self::NotARelay => f.write_str("only a tcpq:// bus has a relay to serve"),
         }
     }
 }
@@ -345,7 +357,11 @@ impl std::error::Error for ClientError {
             Self::Io(e) => Some(e),
             Self::Handshake(e) | Self::Wire(e) => Some(e),
             Self::Pattern(e) => Some(e),
-            Self::ReadOnly | Self::PublishOnly | Self::NotAFile | Self::Closed => None,
+            Self::ReadOnly
+            | Self::PublishOnly
+            | Self::NotAFile
+            | Self::Closed
+            | Self::NotARelay => None,
         }
     }
 }
@@ -436,6 +452,13 @@ enum Transport {
     Log {
         writer: Mutex<LogWriter>,
     },
+    /// A relay this process serves, rather than one it dialled.
+    #[cfg(feature = "patterns")]
+    Serve {
+        served: Arc<serve::Served>,
+        bound: std::net::SocketAddr,
+        accept: Mutex<Option<JoinHandle<()>>>,
+    },
     /// A replay publishes nothing, so it needs no transport.
     Replay,
 }
@@ -482,6 +505,105 @@ impl Client {
                 handler: Arc::new(handler),
             }),
         )
+    }
+
+    /// Serve a `tcpq://` relay, rather than dial one.
+    ///
+    /// A relay is how LCM reaches a consumer that multicast does not: one behind NAT,
+    /// on a routed subnet, or in a container whose network carries no multicast.
+    /// An LCM client of any language dials this, so the reach is the choice of a
+    /// deployment and not of a rewrite.
+    ///
+    /// The URL is the address to bind.
+    /// `tcpq://:7700` listens on every address of this host, and `tcpq://10.0.0.5:7700`
+    /// on that one alone.
+    ///
+    /// `subscriptions` is what `handler` receives.
+    /// It is **not** what the relay carries: a relay carries what its clients ask for.
+    /// Thus a process that publishes onto one and wants none of the traffic back serves
+    /// it with an empty [`Subscriptions`].
+    ///
+    /// ```no_run
+    /// # use lcm_bus::{Client, Delivery, Subscriptions};
+    /// let relay = Client::serve(
+    ///     "tcpq://:7700",
+    ///     Subscriptions::new(),
+    ///     |_: Delivery| {},
+    /// )?;
+    /// relay.publish("/pntos/gnss", &[1, 2, 3])?;
+    /// # Ok::<(), lcm_bus::ClientError>(())
+    /// ```
+    #[cfg(feature = "patterns")]
+    pub fn serve(
+        url: &str,
+        subscriptions: Subscriptions,
+        handler: impl DeliveryHandler + 'static,
+    ) -> Result<Self, ClientError> {
+        let BusUrl::Tcpq(relay) = BusUrl::parse(url)? else {
+            return Err(ClientError::NotARelay);
+        };
+        Self::serve_tcpq(
+            &serve::bind_address(&relay),
+            Some(Receiving {
+                subscriptions: Arc::new(RwLock::new(subscriptions)),
+                handler: Arc::new(handler),
+            }),
+        )
+    }
+
+    /// The clients connected to a relay this process serves, and zero for every other
+    /// kind of bus.
+    #[must_use]
+    pub fn peers(&self) -> usize {
+        match &self.transport {
+            #[cfg(feature = "patterns")]
+            Transport::Serve { served, .. } => served.peers(),
+            _ => 0,
+        }
+    }
+
+    /// The patterns a served relay matches for its clients, over all of them, and zero
+    /// for every other kind of bus.
+    ///
+    /// The patterns of a client arrive after its connection does, so this rises after
+    /// [`Client::peers`] does.
+    /// A publisher that must not lose its first message needs a signal of readiness of
+    /// its own, and the module note says why a count is not one.
+    #[must_use]
+    pub fn peer_patterns(&self) -> usize {
+        match &self.transport {
+            #[cfg(feature = "patterns")]
+            Transport::Serve { served, .. } => served.peer_patterns(),
+            _ => 0,
+        }
+    }
+
+    /// Connections a served relay ended because the greeting was not this protocol.
+    ///
+    /// A port scan, a health check that opens a socket and closes it, and a client of
+    /// a protocol this does not speak all count here.
+    /// A number that climbs beside a `peers` of zero says something reaches the port
+    /// and is not an LCM client.
+    #[must_use]
+    pub fn refused_peers(&self) -> u64 {
+        match &self.transport {
+            #[cfg(feature = "patterns")]
+            Transport::Serve { served, .. } => served.refused(),
+            _ => 0,
+        }
+    }
+
+    /// The address a served relay listens on.
+    ///
+    /// A port of zero in the URL binds one the kernel chose, and this is how a caller
+    /// learns which.
+    #[must_use]
+    pub fn bound(&self) -> Option<std::net::SocketAddr> {
+        match &self.transport {
+            #[cfg(feature = "patterns")]
+            Transport::Serve { bound, .. } => Some(*bound),
+            _ => None,
+        }
     }
 
     /// A bus, and the messages off it, without writing a handler.
@@ -596,6 +718,12 @@ impl Client {
                 let deadline = Instant::now() + relay::LONGEST_WAIT;
                 Self::refused(outbox.flushed(deadline))?;
             }
+            // A relay hands each frame to the outbox of one peer, and one client that
+            // stopped its reads must not hold a flush of the others.
+            // What a peer did not take is the loss of that peer, and it is counted
+            // there.
+            #[cfg(feature = "patterns")]
+            Transport::Serve { .. } => {}
             Transport::Udpm { .. } | Transport::Replay => {}
         }
         Ok(())
@@ -675,6 +803,10 @@ impl Client {
             }
             Transport::Tcpq { outbox, .. } => {
                 self.to_relay(outbox, tcpq::publish(frame)?)?;
+            }
+            #[cfg(feature = "patterns")]
+            Transport::Serve { served, .. } => {
+                serve::publish_from_local(served, frame)?;
             }
             Transport::Log { writer } => {
                 use std::io::Write;
@@ -888,6 +1020,18 @@ impl Client {
                 use std::io::Write;
                 flushed = ignore_poison(writer.lock()).file.flush();
             }
+            // The relay shuts each connection it holds, and waits for the threads that
+            // read and write them.
+            // A client of it reads the end of its stream and decides for itself whether
+            // to dial again.
+            #[cfg(feature = "patterns")]
+            Transport::Serve { served, accept, .. } => {
+                served.shut();
+                let accept = ignore_poison(accept.lock()).take();
+                if let Some(accept) = accept {
+                    let _ = accept.join();
+                }
+            }
             // The log reader looks at `running` between events.
             Transport::Replay => {}
         }
@@ -985,7 +1129,7 @@ impl Drop for ReaderExit<'_> {
             // `lock().unwrap()` everyone writes.
             //
             // The handler is `Sync`, so what it holds at a panic is what any
-            // two threads of the caller's own could hold.
+            // two threads of the caller's own can hold.
             let handler = self.handler;
             let report = panic::AssertUnwindSafe(move || handler.on_stop(cause));
             let _ = panic::catch_unwind(report);

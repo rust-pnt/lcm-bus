@@ -1146,8 +1146,8 @@ fn what_the_relay_holds_is_what_the_client_holds() {
         hand.join().unwrap();
     }
 
-    // Take every rule this client still holds, so the relay should end with
-    // none of them.
+    // Take every rule this client still holds, so the relay ends with none of
+    // them.
     for name in names {
         while client.unsubscribe(name).unwrap_or(false) {}
     }
@@ -1750,10 +1750,10 @@ fn a_close_does_not_throw_away_what_the_kernel_is_still_sending() {
                 payload: &[7; 8],
             })
             .unwrap();
-            // One frame is all it takes to leave bytes unread. Talking the
-            // whole way through is the case where a queue this drains is
-            // never empty, and the client must still not throw away what it
-            // was sending.
+            // One frame is all it takes to leave bytes unread.
+            // A peer that talks the whole way through is the case where a queue
+            // this drains is never empty, and the client must still not throw away
+            // what it was sending.
             let talking = false;
             if chattering >= 1 {
                 stream.write_all(&said).unwrap();

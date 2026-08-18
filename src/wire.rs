@@ -57,7 +57,7 @@ pub const MAX_CHANNEL_LEN: usize = 63;
 /// The LCM limit on a message.
 pub const MAX_MESSAGE_LEN: usize = 1 << 28;
 
-/// Why a frame could not be read or written.
+/// Why a read or a write of a frame failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WireError {
@@ -752,8 +752,9 @@ pub mod udpm {
     }
 }
 
-/// The relay framing: a client subscribes and publishes, and the relay sends
-/// back the messages that match. This crate is the client side.
+/// The relay framing: a client subscribes and publishes, and the relay sends back the
+/// messages that match.
+/// This crate is both sides.
 pub mod tcpq {
     use super::*;
 
@@ -782,6 +783,41 @@ pub mod tcpq {
             return Err(WireError::BadMagic(magic));
         }
         Ok(version)
+    }
+
+    /// The bytes a relay sends a client that it accepted.
+    pub fn server_handshake() -> Vec<u8> {
+        Writer::with_capacity(8)
+            .u32(MAGIC_SERVER)
+            .u32(PROTOCOL_VERSION)
+            .finish()
+    }
+
+    /// The greeting of a client, as a relay reads it.
+    ///
+    /// The version comes back and nothing compares it, which is what LCM does with the
+    /// other direction.
+    /// One protocol version exists.
+    pub fn check_client_handshake(greeting: &[u8]) -> Result<u32, WireError> {
+        let mut r = Reader::new(greeting);
+        let magic = r.u32()?;
+        let version = r.u32()?;
+        if magic != MAGIC_CLIENT {
+            return Err(WireError::BadMagic(magic));
+        }
+        Ok(version)
+    }
+
+    /// What a client sends a relay.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Request<'a> {
+        /// A message for the relay to send on to every client that matches it.
+        Publish(FrameRef<'a>),
+        /// A pattern to match.
+        /// The relay reads it as a Java regex against the whole channel name.
+        Subscribe(&'a str),
+        /// The relay removes the first record equal to this.
+        Unsubscribe(&'a str),
     }
 
     /// The relay reads `pattern` as a Java regex and matches the full name.
@@ -876,6 +912,82 @@ pub mod tcpq {
         }
         let payload = r.take(payload_len)?;
         Ok(Decoded::Item(FrameRef { channel, payload }, frame))
+    }
+
+    /// Read one request of a client, as a relay reads it.
+    ///
+    /// This is the mirror of [`decode`], which reads the one frame type that travels
+    /// the other way.
+    /// A relay reads three.
+    pub fn decode_request(data: &[u8]) -> Result<Decoded<Request<'_>>, WireError> {
+        // The type of the frame, and the length of the first field.
+        const HEAD: usize = 8;
+        if data.len() < HEAD {
+            return Ok(Decoded::Need(HEAD));
+        }
+        let mut r = Reader::new(data);
+        let kind = r.u32()?;
+        if !matches!(
+            kind,
+            MESSAGE_TYPE_PUBLISH | MESSAGE_TYPE_SUBSCRIBE | MESSAGE_TYPE_UNSUBSCRIBE
+        ) {
+            // Nothing gives the length of a frame of a type this does not read, so
+            // nothing after it can be found.
+            // The stream ends here.
+            return Err(WireError::UnknownFrameType(kind));
+        }
+
+        let first_len = r.u32()? as usize;
+        if first_len > CHANNEL_READ_MAX {
+            return Err(WireError::ChannelTooLong(first_len));
+        }
+
+        // A subscription is the type and one string.
+        // A publish carries a payload behind the name, so nothing gives the length of
+        // the frame until the name is here.
+        if kind != MESSAGE_TYPE_PUBLISH {
+            let frame = HEAD + first_len;
+            if data.len() < frame {
+                return Ok(Decoded::Need(frame));
+            }
+            let pattern = r.take(first_len)?;
+            // A pattern that is not text is a whole frame of known length, so a step
+            // over it costs the request and not the stream.
+            let Ok(pattern) = core::str::from_utf8(pattern) else {
+                return Ok(Decoded::Skip(frame));
+            };
+            let request = if kind == MESSAGE_TYPE_SUBSCRIBE {
+                Request::Subscribe(pattern)
+            } else {
+                Request::Unsubscribe(pattern)
+            };
+            return Ok(Decoded::Item(request, frame));
+        }
+
+        let head = HEAD + first_len + 4;
+        if data.len() < head {
+            return Ok(Decoded::Need(head));
+        }
+        let channel = r.take(first_len)?;
+        let payload_len = r.u32()? as usize;
+        if payload_len > MAX_MESSAGE_LEN {
+            return Err(WireError::MessageTooLarge(payload_len));
+        }
+        let frame = head + payload_len;
+        if data.len() < frame {
+            return Ok(Decoded::Need(frame));
+        }
+        let Ok(channel) = core::str::from_utf8(channel) else {
+            return Ok(Decoded::Skip(frame));
+        };
+        if super::check_channel(channel, MAX_CHANNEL_LEN).is_err() {
+            return Ok(Decoded::Skip(frame));
+        }
+        let payload = r.take(payload_len)?;
+        Ok(Decoded::Item(
+            Request::Publish(FrameRef { channel, payload }),
+            frame,
+        ))
     }
 }
 
@@ -1056,5 +1168,95 @@ pub mod log {
     pub fn resync(data: &[u8]) -> Option<usize> {
         let magic = MAGIC.to_be_bytes();
         data.windows(magic.len()).position(|w| w == magic)
+    }
+}
+
+#[cfg(test)]
+mod tcpq_server_tests {
+    use super::tcpq::*;
+    use super::{Decoded, FrameRef};
+
+    /// The two greetings are the two magic numbers, and each side refuses the other's.
+    /// A relay that answered its own greeting would look like a client to the peer it
+    /// accepted.
+    #[test]
+    fn each_side_refuses_the_greeting_of_its_own_kind() {
+        assert!(check_client_handshake(&handshake()).is_ok());
+        assert!(check_handshake(&server_handshake()).is_ok());
+        assert!(check_client_handshake(&server_handshake()).is_err());
+        assert!(check_handshake(&handshake()).is_err());
+    }
+
+    #[test]
+    fn a_relay_reads_the_subscription_a_client_wrote() {
+        let bytes = subscribe("/pntos/.*");
+        assert_eq!(
+            decode_request(&bytes).unwrap(),
+            Decoded::Item(Request::Subscribe("/pntos/.*"), bytes.len())
+        );
+
+        let bytes = unsubscribe("/pntos/.*");
+        assert_eq!(
+            decode_request(&bytes).unwrap(),
+            Decoded::Item(Request::Unsubscribe("/pntos/.*"), bytes.len())
+        );
+    }
+
+    #[test]
+    fn a_relay_reads_the_publish_a_client_wrote() {
+        let frame = FrameRef {
+            channel: "/ublox",
+            payload: &[1, 2, 3, 4],
+        };
+        let bytes = publish(frame).unwrap();
+        assert_eq!(
+            decode_request(&bytes).unwrap(),
+            Decoded::Item(Request::Publish(frame), bytes.len())
+        );
+    }
+
+    /// A stream gives what it gives.
+    /// The decoder asks for the whole frame and takes none of it until all of it is
+    /// there.
+    #[test]
+    fn a_partial_frame_asks_for_the_rest() {
+        let bytes = publish(FrameRef {
+            channel: "/ublox",
+            payload: &[9; 64],
+        })
+        .unwrap();
+        for n in 0..bytes.len() {
+            match decode_request(&bytes[..n]).unwrap() {
+                Decoded::Need(needs) => assert!(needs > n, "{n} bytes asked for {needs}"),
+                other => panic!("{n} of {} bytes gave {other:?}", bytes.len()),
+            }
+        }
+    }
+
+    /// A frame this relay cannot measure ends the stream, because nothing can find
+    /// what is behind it.
+    #[test]
+    fn a_frame_of_an_unknown_type_ends_the_stream() {
+        let mut bytes = subscribe("/x");
+        bytes[3] = 99;
+        assert!(decode_request(&bytes).is_err());
+    }
+
+    /// Two requests in one read, which is what a client sends where it subscribes to
+    /// several patterns at once.
+    #[test]
+    fn the_length_of_a_request_finds_the_next_one() {
+        let mut stream = subscribe("/a");
+        let second = subscribe("/b");
+        stream.extend_from_slice(&second);
+
+        let Decoded::Item(first, used) = decode_request(&stream).unwrap() else {
+            panic!("the first request");
+        };
+        assert_eq!(first, Request::Subscribe("/a"));
+        assert_eq!(
+            decode_request(&stream[used..]).unwrap(),
+            Decoded::Item(Request::Subscribe("/b"), second.len())
+        );
     }
 }

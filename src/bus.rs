@@ -241,7 +241,7 @@ pub struct Everything;
 /// The steps one match can take before `fancy_regex` gives up on it.
 ///
 /// A channel name comes off the wire, and a pattern with a lookaround and a
-/// quantifier takes a step for each reading of that name it could try — on
+/// quantifier takes a step for each reading of that name it can try — on
 /// the thread that reads the socket. A name is short, so a pattern that
 /// means anything for one is done long before this.
 #[cfg(feature = "patterns")]
